@@ -18,20 +18,28 @@ extern "C" {
 #define BESTEST_CODE_SECTION(s)  __attribute__((section(s)))
 #endif
 
+#ifndef BESTEST_WEAK
+#define BESTEST_WEAK __attribute__((weak))
+#endif
+
 #define BESTEST_LOG_SUCCESS               1
 #define BESTEST_LOG_DURATION              2
 #define BESTEST_ERROR_MESSAGE_MAX_LENGTH  256
 
-typedef void (*bestest_UnitTest)(void);
-
+typedef void (*bestest_UnitTest)(void*);
+typedef void* (*bestest_Setup)(void);
+typedef void (*bestest_TearDown)(void*);
 
 typedef struct bestest_Result {
     size_t numErrors;
 } bestest_Result;
 
 struct bestest_Test {
-    const char* domain;
+    const char *domain;
+    const char *name;
     bestest_UnitTest test;
+    bestest_Setup *setup;
+    bestest_TearDown *teardown;
 };
 
 struct bestest_Context {
@@ -68,21 +76,30 @@ struct bestest_Context {
  * API
  */
 #define bestest_CreateGlobalContext()   \
-    extern struct bestest_Test __start_BESTEST_TESTS; \
-    extern struct bestest_Test __stop_BESTEST_TESTS; \
-    struct bestest_Context bestest_context = { .startOfTests = &__start_BESTEST_TESTS, .endOfTests = &__stop_BESTEST_TESTS }; 
+    extern struct bestest_Test __start_bestest_tests; \
+    extern struct bestest_Test __stop_bestest_tests; \
+    struct bestest_Context bestest_context = { .startOfTests = &__start_bestest_tests, .endOfTests = &__stop_bestest_tests }; 
 
 
-#define BESTEST_TEST(domain, name) BESTEST_CODE_SECTION(".utest_functionpath") static const char* domain##_##name##path = #domain #name; void domain##_##name(void); BESTEST_CODE_SECTION("BESTEST_TESTS") struct bestest_Test domain##_##name##Ptr = { #domain, &domain##_##name }; void domain##_##name(void)
+#define BESTEST_TEST(domain, name) \
+    BESTEST_CODE_SECTION(".utest_functionpath") static const char* domain##_##name##path = #domain #name; \
+    void domain##_##name(void *context); \
+    BESTEST_WEAK extern bestest_Setup domain##_setupPtr; \
+    BESTEST_WEAK extern bestest_TearDown domain##_teardownPtr; \
+    BESTEST_CODE_SECTION("bestest_tests") struct bestest_Test domain##_##name##Ptr = { #domain, #domain #name, &domain##_##name, &domain##_setupPtr, &domain##_teardownPtr }; \
+    void domain##_##name(void *context)
 
-static inline bestest_Result bestest_Run(void);
+#define BESTEST_SETUP(domain)       void *domain##_setup(void); bestest_Setup domain##_setupPtr = &domain##_setup; BESTEST_CODE_SECTION("bestest_setups")      void *domain##_setup(void)
+#define BESTEST_TEARDOWN(domain)    void domain##_teardown(void*); bestest_TearDown domain##_teardownPtr = &domain##_teardown; BESTEST_CODE_SECTION("bestest_teardowns")   void domain##_teardown(void *context)
+
+static inline bestest_Result bestest_Run(const char *testList[], const char *ignoreList[]);
 
 static inline void bestest_SetVerbosity(int level);
 
 /*
  * User implemented
  */
-void bestest_LogResult(const char* msg);
+void bestest_LogResult(const char *msg);
 unsigned long long bestest_Time(void);
 
 
@@ -95,20 +112,18 @@ unsigned long long bestest_Time(void);
 extern struct bestest_Context bestest_context;
 
 
-static inline void bestest_RunTest(const char* domain, bestest_UnitTest unitTest)
+static inline void bestest_RunTest(struct bestest_Test *test)
 {
-static char logMsg[200];
-    bestest_UnitTest test = unitTest;
+static char logMsg[BESTEST_ERROR_MESSAGE_MAX_LENGTH];
     unsigned long long endTime, startTime = bestest_Time();
     int offset = 0;
 
+    void *testContext = test->setup ? (*test->setup)() : NULL;
     if (setjmp(bestest_context.uut.exitPoint) == 0) {
-        test();
+        test->test(testContext);
         endTime = bestest_Time();
         if (bestest_context.opts.verbosity & BESTEST_LOG_SUCCESS) {
-            offset = snprintf(logMsg, sizeof(logMsg), "[SUCCESS] in %s::%s", domain, bestest_context.uut.funcName);
-            if (bestest_context.opts.verbosity & BESTEST_LOG_DURATION)
-                snprintf(logMsg + offset, sizeof logMsg - offset, " (duration: %.3f)", ((double)endTime - (double)startTime) / 1000.0);
+            offset = snprintf(logMsg, sizeof(logMsg), "[SUCCESS] in %s::%s", test->domain, bestest_context.uut.funcName);
         }
         else
             logMsg[0] = 0;
@@ -116,27 +131,40 @@ static char logMsg[200];
     else {
         endTime = bestest_Time();
         bestest_context.result.numErrors++;
-        offset = snprintf(logMsg, sizeof(logMsg), "[ERROR  ] in %s::%s:%zu => %s", domain, bestest_context.uut.funcName, bestest_context.uut.line, bestest_context.uut.error);
-        if (bestest_context.opts.verbosity & BESTEST_LOG_DURATION) 
-                snprintf(logMsg + offset, sizeof logMsg - offset, " (duration: %.3f)", ((double)endTime - (double)startTime) / 1000.0);
+        offset = snprintf(logMsg, sizeof(logMsg), "[ERROR  ] in %s::%s:%zu => %s", test->domain, bestest_context.uut.funcName, bestest_context.uut.line, bestest_context.uut.error);
     }
+    if (bestest_context.opts.verbosity & BESTEST_LOG_DURATION)
+        snprintf(logMsg + offset, sizeof logMsg - offset, " (duration: %.3f)", ((double)endTime - (double)startTime) / 1000.0);
+    if (test->teardown)
+        (*test->teardown)(testContext);
 
 
     if (logMsg[0])
         bestest_LogResult(logMsg);
 }
 
-static inline bestest_Result bestest_Run(void)
+static inline bool bestest_TestInList(const char *list[], const char *test)
+{
+    for (const char **entry = list; *entry; entry++)
+        if (!strcmp(*entry, test)) 
+            return true;
+    return false;
+}
+
+static inline bestest_Result bestest_Run(const char *testList[], const char *ignoreList[])
 {
     for (struct bestest_Test *test = bestest_context.startOfTests; test < bestest_context.endOfTests; test++) {
-        bestest_RunTest(test->domain, test->test);
+        if (ignoreList && bestest_TestInList(ignoreList, test->name))
+            continue;
+        if (!testList || bestest_TestInList(testList, test->name))
+            bestest_RunTest(test);
     }
 
     return bestest_context.result;
 }
 
 
-static inline void bestest_Assert_(bool expr, const char* funcName, size_t line, const char* exprText)
+static inline void bestest_Assert_(bool expr, const char *funcName, size_t line, const char *exprText)
 {
     bestest_context.uut.funcName = funcName;
     if (!expr) {
@@ -146,7 +174,7 @@ static inline void bestest_Assert_(bool expr, const char* funcName, size_t line,
     }
 }
 
-static inline void bestest_AssertMemory_(void* p1, void* p2, size_t size, const char* funcName, size_t line, const char* exprText)
+static inline void bestest_AssertMemory_(void *p1, void *p2, size_t size, const char *funcName, size_t line, const char *exprText)
 {
     bestest_context.uut.funcName = funcName;
     if (memcmp(p1, p2, size)) {
